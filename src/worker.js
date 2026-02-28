@@ -1,8 +1,16 @@
 import 'dotenv/config';
 import cron from 'node-cron';
 import { ImapFlow } from 'imapflow';
-import { simpleParser } from 'mailparser';
 import { createClient } from '@supabase/supabase-js';
+
+let simpleParserFn = null;
+try {
+  const mailparserModule = await import('mailparser');
+  simpleParserFn = mailparserModule?.simpleParser || null;
+  console.log(`${new Date().toISOString()} [SYNC] mailparser loaded successfully`);
+} catch (error) {
+  console.warn(`${new Date().toISOString()} [SYNC] mailparser not available, using raw fallback parser: ${error?.message || error}`);
+}
 
 const chatTokenRegex = /\[CRM-CHAT:([0-9a-fA-F-]{36})\]/;
 const fetchLimit = Number(process.env.FETCH_LIMIT || 50);
@@ -56,7 +64,21 @@ const parseMimeContent = async (source) => {
     };
   }
 
-  const parsed = await simpleParser(source);
+  if (!simpleParserFn) {
+    const raw = String(source || '');
+    return {
+      subject: null,
+      fromEmail: null,
+      fromName: null,
+      toList: [],
+      ccList: [],
+      bodyText: raw,
+      bodyHtml: '',
+      attachments: [],
+    };
+  }
+
+  const parsed = await simpleParserFn(source);
   const from = parsed?.from?.value?.[0];
   const bodyHtml = typeof parsed?.html === 'string'
     ? parsed.html
@@ -222,7 +244,7 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => 
 
   const { error: insertError } = await supabase
     .from('inbox_emails')
-    .insert(row);
+    .upsert(row, { onConflict: 'account_id,message_id', ignoreDuplicates: true });
 
   if (insertError) {
     throw new Error(`insert failed: ${insertError.message}`);
