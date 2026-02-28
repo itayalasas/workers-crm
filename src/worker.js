@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import cron from 'node-cron';
 import { ImapFlow } from 'imapflow';
+import { simpleParser } from 'mailparser';
 import { createClient } from '@supabase/supabase-js';
 
 const chatTokenRegex = /\[CRM-CHAT:([0-9a-fA-F-]{36})\]/;
@@ -22,6 +23,61 @@ const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SER
 });
 
 const ts = () => new Date().toISOString();
+
+const toRecipientList = (addressObject) => {
+  const value = addressObject?.value || [];
+  return value
+    .map((entry) => ({
+      email: String(entry?.address || '').trim(),
+      name: entry?.name ? String(entry.name).trim() : undefined,
+    }))
+    .filter((entry) => !!entry.email);
+};
+
+const stripHtml = (html) =>
+  String(html || '')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const parseMimeContent = async (source) => {
+  if (!source) {
+    return {
+      subject: null,
+      fromEmail: null,
+      fromName: null,
+      toList: [],
+      ccList: [],
+      bodyText: '',
+      bodyHtml: '',
+      attachments: [],
+    };
+  }
+
+  const parsed = await simpleParser(source);
+  const from = parsed?.from?.value?.[0];
+  const bodyHtml = typeof parsed?.html === 'string'
+    ? parsed.html
+    : (parsed?.html ? String(parsed.html) : '');
+  const bodyText = String(parsed?.text || '').trim();
+
+  return {
+    subject: parsed?.subject || null,
+    fromEmail: from?.address ? String(from.address).trim() : null,
+    fromName: from?.name ? String(from.name).trim() : null,
+    toList: toRecipientList(parsed?.to),
+    ccList: toRecipientList(parsed?.cc),
+    bodyText: bodyText || (bodyHtml ? stripHtml(bodyHtml) : ''),
+    bodyHtml,
+    attachments: (parsed?.attachments || []).map((attachment) => ({
+      filename: attachment?.filename || 'adjunto',
+      size: Number(attachment?.size || 0),
+      type: String(attachment?.contentType || 'application/octet-stream'),
+    })),
+  };
+};
 
 const buildImapConfigs = (account) => {
   const host = String(account.imap_host || '').trim().toLowerCase();
@@ -105,7 +161,8 @@ const connectWithFallback = async (account) => {
 };
 
 const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => {
-  const messageId = message.envelope?.messageId || `${message.uid}-${Date.now()}`;
+  const envelopeMessageId = String(message.envelope?.messageId || '').trim();
+  const messageId = envelopeMessageId || `imap-${account.id}-${message.uid}`;
 
   const { data: existing, error: existingError } = await supabase
     .from('inbox_emails')
@@ -127,22 +184,30 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => 
     .map((entry) => ({ email: entry?.address || '', name: entry?.name || undefined }))
     .filter((entry) => !!entry.email);
 
+  const mime = await parseMimeContent(sourceText);
+  const normalizedToList = mime.toList.length > 0
+    ? mime.toList
+    : (toList.length > 0 ? toList : [{ email: account.email_address }]);
+  const subject = mime.subject || message.envelope?.subject || '(Sin asunto)';
+  const fromEmail = mime.fromEmail || from?.address || 'unknown';
+  const fromName = mime.fromName || from?.name || fromEmail || 'Unknown';
+
   const row = {
     account_id: account.id,
     user_id: userId,
     message_id: messageId,
     thread_id: message.envelope?.inReplyTo || null,
-    subject: message.envelope?.subject || '(Sin asunto)',
-    from_email: from?.address || 'unknown',
-    from_name: from?.name || from?.address || 'Unknown',
-    to_emails: toList.length > 0 ? toList : [{ email: account.email_address }],
-    cc_emails: [],
+    subject,
+    from_email: fromEmail,
+    from_name: fromName,
+    to_emails: normalizedToList,
+    cc_emails: mime.ccList,
     bcc_emails: [],
     received_at: message.envelope?.date || new Date().toISOString(),
     email_date: message.envelope?.date || new Date().toISOString(),
-    body_text: sourceText,
-    body_html: sourceText,
-    attachments: [],
+    body_text: mime.bodyText,
+    body_html: mime.bodyHtml,
+    attachments: mime.attachments,
     is_read: message.flags?.has('\\Seen') || false,
     is_starred: message.flags?.has('\\Flagged') || false,
     is_archived: false,
@@ -163,8 +228,8 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => 
     throw new Error(`insert failed: ${insertError.message}`);
   }
 
-  const subject = message.envelope?.subject || '';
-  const tokenMatch = subject.match(chatTokenRegex);
+  const conversationSubject = row.subject || '';
+  const tokenMatch = conversationSubject.match(chatTokenRegex);
   const conversationId = tokenMatch?.[1] || null;
 
   if (conversationId) {
@@ -173,8 +238,8 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => 
       sender_type: 'visitor',
       sender_id: `email:${messageId}`,
       sender_name: row.from_name,
-      message: sourceText.slice(0, 4000) || `(Respuesta por email) ${subject}`,
-      attachments: [],
+      message: row.body_text.slice(0, 4000) || `(Respuesta por email) ${conversationSubject}`,
+      attachments: row.attachments || [],
     });
 
     await supabase
