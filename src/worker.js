@@ -42,6 +42,27 @@ const toRecipientList = (addressObject) => {
     .filter((entry) => !!entry.email);
 };
 
+const looksLikeRawMimeSource = (value) => {
+  if (!value) return false;
+  const normalized = String(value).toLowerCase();
+  return (
+    normalized.includes('return-path:') &&
+    normalized.includes('content-type:') &&
+    normalized.includes('mime-version:')
+  );
+};
+
+const looksLikeHtmlContent = (value) => {
+  if (!value) return false;
+  const normalized = String(value).trim().toLowerCase();
+  return (
+    normalized.startsWith('<!doctype html') ||
+    normalized.startsWith('<html') ||
+    (normalized.includes('<body') && normalized.includes('</body>')) ||
+    /<\/?[a-z][\s\S]*>/i.test(normalized)
+  );
+};
+
 const stripHtml = (html) =>
   String(html || '')
     .replace(/<style[\s\S]*?<\/style>/gi, ' ')
@@ -65,7 +86,33 @@ const parseMimeContent = async (source) => {
   }
 
   if (!simpleParserFn) {
-    const raw = String(source || '');
+    const raw = Buffer.isBuffer(source) ? source.toString('utf8') : String(source || '');
+    if (looksLikeRawMimeSource(raw)) {
+      return {
+        subject: null,
+        fromEmail: null,
+        fromName: null,
+        toList: [],
+        ccList: [],
+        bodyText: raw,
+        bodyHtml: '',
+        attachments: [],
+      };
+    }
+
+    if (looksLikeHtmlContent(raw)) {
+      return {
+        subject: null,
+        fromEmail: null,
+        fromName: null,
+        toList: [],
+        ccList: [],
+        bodyText: stripHtml(raw),
+        bodyHtml: raw,
+        attachments: [],
+      };
+    }
+
     return {
       subject: null,
       fromEmail: null,
@@ -80,10 +127,19 @@ const parseMimeContent = async (source) => {
 
   const parsed = await simpleParserFn(source);
   const from = parsed?.from?.value?.[0];
-  const bodyHtml = typeof parsed?.html === 'string'
+  let bodyText = String(parsed?.text || '').trim();
+  let bodyHtml = typeof parsed?.html === 'string'
     ? parsed.html
     : (parsed?.html ? String(parsed.html) : '');
-  const bodyText = String(parsed?.text || '').trim();
+
+  if (!bodyHtml && looksLikeHtmlContent(bodyText)) {
+    bodyHtml = bodyText;
+    bodyText = stripHtml(bodyText);
+  }
+
+  if (!bodyText && bodyHtml) {
+    bodyText = stripHtml(bodyHtml);
+  }
 
   return {
     subject: parsed?.subject || null,
@@ -182,7 +238,7 @@ const connectWithFallback = async (account) => {
   throw err;
 };
 
-const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => {
+const upsertIncomingEmail = async ({ account, userId, message, sourceContent }) => {
   const envelopeMessageId = String(message.envelope?.messageId || '').trim();
   const messageId = envelopeMessageId || `imap-${account.id}-${message.uid}`;
 
@@ -206,7 +262,7 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => 
     .map((entry) => ({ email: entry?.address || '', name: entry?.name || undefined }))
     .filter((entry) => !!entry.email);
 
-  const mime = await parseMimeContent(sourceText);
+  const mime = await parseMimeContent(sourceContent);
   const normalizedToList = mime.toList.length > 0
     ? mime.toList
     : (toList.length > 0 ? toList : [{ email: account.email_address }]);
@@ -302,13 +358,13 @@ const syncAccount = async (account) => {
         source: true,
         uid: true,
       })) {
-        const sourceText = message.source ? message.source.toString() : '';
+        const sourceContent = message.source || '';
         try {
           const result = await upsertIncomingEmail({
             account,
             userId,
             message,
-            sourceText,
+            sourceContent,
           });
 
           if (result.inserted) synced += 1;
