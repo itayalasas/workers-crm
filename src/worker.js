@@ -1,0 +1,313 @@
+import 'dotenv/config';
+import cron from 'node-cron';
+import { ImapFlow } from 'imapflow';
+import { createClient } from '@supabase/supabase-js';
+
+const chatTokenRegex = /\[CRM-CHAT:([0-9a-fA-F-]{36})\]/;
+const fetchLimit = Number(process.env.FETCH_LIMIT || 50);
+const syncCron = process.env.SYNC_CRON || '*/2 * * * *';
+const accountEmailFilter = (process.env.ACCOUNT_EMAIL || '').trim().toLowerCase();
+const accountIdFilter = (process.env.ACCOUNT_ID || '').trim();
+const dryRun = String(process.env.DRY_RUN || 'false').toLowerCase() === 'true';
+
+const requiredEnv = ['SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY'];
+for (const key of requiredEnv) {
+  if (!process.env[key]) {
+    throw new Error(`Missing env var: ${key}`);
+  }
+}
+
+const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY, {
+  auth: { persistSession: false },
+});
+
+const ts = () => new Date().toISOString();
+
+const buildImapConfigs = (account) => {
+  const host = String(account.imap_host || '').trim().toLowerCase();
+  const port = Number(account.imap_port) || (account.use_ssl ? 993 : 143);
+  const secure = !!account.use_ssl || port === 993;
+
+  const base = {
+    host,
+    auth: {
+      user: String(account.imap_username || '').trim(),
+      pass: String(account.imap_password || ''),
+    },
+    logger: false,
+    disableAutoIdle: true,
+  };
+
+  return [
+    {
+      ...base,
+      port,
+      secure,
+      ...(secure ? { doSTARTTLS: false } : { requireTLS: true, doSTARTTLS: true }),
+      tls: { rejectUnauthorized: false, servername: host },
+      greetingTimeout: 25000,
+      socketTimeout: 25000,
+      connectionTimeout: 25000,
+      name: `saved(${port}/${secure ? 'ssl' : 'starttls'})`,
+    },
+    {
+      ...base,
+      port: 993,
+      secure: true,
+      doSTARTTLS: false,
+      greetingTimeout: 20000,
+      socketTimeout: 20000,
+      connectionTimeout: 20000,
+      name: 'ssl-993',
+    },
+    {
+      ...base,
+      port: 143,
+      secure: false,
+      requireTLS: true,
+      doSTARTTLS: true,
+      greetingTimeout: 18000,
+      socketTimeout: 18000,
+      connectionTimeout: 18000,
+      name: 'starttls-143',
+    },
+  ];
+};
+
+const connectWithFallback = async (account) => {
+  const configs = buildImapConfigs(account);
+  const attempts = [];
+  let lastError;
+
+  for (const config of configs) {
+    try {
+      console.log(`${ts()} [IMAP] Trying ${account.email_address} -> ${config.name}`);
+      const client = new ImapFlow(config);
+      await client.connect();
+      attempts.push({ name: config.name, success: true });
+      return { client, attempts, used: config.name };
+    } catch (error) {
+      lastError = error;
+      attempts.push({
+        name: config.name,
+        success: false,
+        code: error?.code,
+        error: error?.message,
+      });
+      console.error(`${ts()} [IMAP] Failed ${config.name}: ${error?.code || 'UNKNOWN'} ${error?.message || ''}`);
+    }
+  }
+
+  const err = new Error(`All IMAP attempts failed: ${lastError?.message || 'Unknown error'}`);
+  err.code = lastError?.code;
+  err.attempts = attempts;
+  throw err;
+};
+
+const upsertIncomingEmail = async ({ account, userId, message, sourceText }) => {
+  const messageId = message.envelope?.messageId || `${message.uid}-${Date.now()}`;
+
+  const { data: existing, error: existingError } = await supabase
+    .from('inbox_emails')
+    .select('id')
+    .eq('account_id', account.id)
+    .eq('message_id', messageId)
+    .maybeSingle();
+
+  if (existingError) {
+    throw new Error(`existing check failed: ${existingError.message}`);
+  }
+
+  if (existing) {
+    return { inserted: false, messageId };
+  }
+
+  const from = message.envelope?.from?.[0];
+  const toList = (message.envelope?.to || [])
+    .map((entry) => ({ email: entry?.address || '', name: entry?.name || undefined }))
+    .filter((entry) => !!entry.email);
+
+  const row = {
+    account_id: account.id,
+    user_id: userId,
+    message_id: messageId,
+    thread_id: message.envelope?.inReplyTo || null,
+    subject: message.envelope?.subject || '(Sin asunto)',
+    from_email: from?.address || 'unknown',
+    from_name: from?.name || from?.address || 'Unknown',
+    to_emails: toList.length > 0 ? toList : [{ email: account.email_address }],
+    cc_emails: [],
+    bcc_emails: [],
+    received_at: message.envelope?.date || new Date().toISOString(),
+    email_date: message.envelope?.date || new Date().toISOString(),
+    body_text: sourceText,
+    body_html: sourceText,
+    attachments: [],
+    is_read: message.flags?.has('\\Seen') || false,
+    is_starred: message.flags?.has('\\Flagged') || false,
+    is_archived: false,
+    is_deleted: false,
+    folder: 'inbox',
+    labels: [],
+  };
+
+  if (dryRun) {
+    return { inserted: true, messageId, dryRun: true };
+  }
+
+  const { error: insertError } = await supabase
+    .from('inbox_emails')
+    .insert(row);
+
+  if (insertError) {
+    throw new Error(`insert failed: ${insertError.message}`);
+  }
+
+  const subject = message.envelope?.subject || '';
+  const tokenMatch = subject.match(chatTokenRegex);
+  const conversationId = tokenMatch?.[1] || null;
+
+  if (conversationId) {
+    await supabase.from('webchat_messages').insert({
+      conversation_id: conversationId,
+      sender_type: 'visitor',
+      sender_id: `email:${messageId}`,
+      sender_name: row.from_name,
+      message: sourceText.slice(0, 4000) || `(Respuesta por email) ${subject}`,
+      attachments: [],
+    });
+
+    await supabase
+      .from('webchat_conversations')
+      .update({ last_message_at: new Date().toISOString(), updated_at: new Date().toISOString() })
+      .eq('id', conversationId);
+  }
+
+  return { inserted: true, messageId };
+};
+
+const syncAccount = async (account) => {
+  const userId = account.created_by || account.user_id;
+  if (!userId) {
+    console.warn(`${ts()} [SYNC] Skipping ${account.email_address}: missing user id`);
+    return { synced: 0, skipped: 0, account: account.email_address };
+  }
+
+  const { client, used, attempts } = await connectWithFallback(account);
+  console.log(`${ts()} [SYNC] Connected ${account.email_address} with ${used}`);
+
+  let synced = 0;
+  let skipped = 0;
+
+  try {
+    const lock = await client.getMailboxLock('INBOX');
+    try {
+      const total = client.mailbox.exists || 0;
+      if (total === 0) {
+        return { synced, skipped, account: account.email_address, attempts };
+      }
+
+      const count = Math.min(fetchLimit, total);
+      const start = Math.max(1, total - count + 1);
+
+      for await (const message of client.fetch(`${start}:*`, {
+        envelope: true,
+        source: true,
+        uid: true,
+      })) {
+        const sourceText = message.source ? message.source.toString() : '';
+        try {
+          const result = await upsertIncomingEmail({
+            account,
+            userId,
+            message,
+            sourceText,
+          });
+
+          if (result.inserted) synced += 1;
+          else skipped += 1;
+        } catch (error) {
+          console.error(`${ts()} [SYNC] Message process error: ${error?.message || error}`);
+        }
+      }
+    } finally {
+      lock.release();
+    }
+  } finally {
+    if (client.usable) {
+      await client.logout().catch(() => null);
+    }
+  }
+
+  return { synced, skipped, account: account.email_address, attempts };
+};
+
+const loadAccounts = async () => {
+  let query = supabase
+    .from('email_accounts')
+    .select('*')
+    .eq('is_active', true);
+
+  if (accountIdFilter) {
+    query = query.eq('id', accountIdFilter);
+  }
+
+  const { data, error } = await query;
+  if (error) {
+    throw new Error(`load accounts failed: ${error.message}`);
+  }
+
+  let accounts = data || [];
+  if (accountEmailFilter) {
+    accounts = accounts.filter((acc) => String(acc.email_address || '').toLowerCase() === accountEmailFilter);
+  }
+
+  return accounts;
+};
+
+let running = false;
+const runSync = async () => {
+  if (running) {
+    console.log(`${ts()} [SYNC] Previous cycle still running, skipping`);
+    return;
+  }
+  running = true;
+
+  try {
+    const accounts = await loadAccounts();
+    if (!accounts.length) {
+      console.log(`${ts()} [SYNC] No active accounts found`);
+      return;
+    }
+
+    console.log(`${ts()} [SYNC] Accounts to process: ${accounts.length}`);
+    let totalSynced = 0;
+    let totalSkipped = 0;
+
+    for (const account of accounts) {
+      try {
+        const result = await syncAccount(account);
+        totalSynced += result.synced;
+        totalSkipped += result.skipped;
+        console.log(`${ts()} [SYNC] ${result.account}: +${result.synced} synced, ${result.skipped} skipped`);
+      } catch (error) {
+        console.error(`${ts()} [SYNC] Account error ${account.email_address}: ${error?.message || error}`);
+      }
+    }
+
+    console.log(`${ts()} [SYNC] Cycle complete. Synced=${totalSynced}, Skipped=${totalSkipped}`);
+  } catch (error) {
+    console.error(`${ts()} [SYNC] Cycle failed: ${error?.message || error}`);
+  } finally {
+    running = false;
+  }
+};
+
+const once = process.argv.includes('--once');
+if (once) {
+  runSync().finally(() => process.exit(0));
+} else {
+  console.log(`${ts()} [SYNC] Worker started. Cron=${syncCron}, FetchLimit=${fetchLimit}, DryRun=${dryRun}`);
+  runSync();
+  cron.schedule(syncCron, runSync);
+}

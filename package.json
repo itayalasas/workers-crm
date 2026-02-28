@@ -1,0 +1,16 @@
+{
+  "name": "crmpro-imap-sync-worker",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/worker.js",
+    "once": "node src/worker.js --once"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.1",
+    "dotenv": "^16.4.7",
+    "imapflow": "^1.0.181",
+    "node-cron": "^3.0.3"
+  }
+}
