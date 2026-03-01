@@ -71,6 +71,44 @@ const stripHtml = (html) =>
     .replace(/\s+/g, ' ')
     .trim();
 
+const decodeQuotedPrintable = (input) => {
+  if (!input) return '';
+  const normalized = String(input).replace(/=\r?\n/g, '');
+  const bytes = [];
+
+  for (let index = 0; index < normalized.length; index += 1) {
+    if (normalized[index] === '=' && /^[A-Fa-f0-9]{2}$/.test(normalized.slice(index + 1, index + 3))) {
+      bytes.push(Number.parseInt(normalized.slice(index + 1, index + 3), 16));
+      index += 2;
+      continue;
+    }
+    bytes.push(normalized.charCodeAt(index));
+  }
+
+  try {
+    return Buffer.from(bytes).toString('utf8');
+  } catch {
+    return normalized;
+  }
+};
+
+const extractMimePart = (raw, mimeType) => {
+  if (!raw) return '';
+  const regex = new RegExp(`Content-Type:\\s*${mimeType}[^\\n]*[\\s\\S]*?\\r?\\n\\r?\\n([\\s\\S]*?)(?:\\r?\\n--[^\\r\\n]+|$)`, 'i');
+  const match = String(raw).match(regex);
+  if (!match?.[1]) return '';
+
+  const transferEncodingMatch = match[0].match(/Content-Transfer-Encoding:\s*([^\r\n]+)/i);
+  const encoding = transferEncodingMatch?.[1]?.trim().toLowerCase() || '';
+  const part = match[1].trim();
+
+  if (encoding.includes('quoted-printable')) {
+    return decodeQuotedPrintable(part);
+  }
+
+  return part;
+};
+
 const parseMimeContent = async (source) => {
   if (!source) {
     return {
@@ -127,10 +165,22 @@ const parseMimeContent = async (source) => {
 
   const parsed = await simpleParserFn(source);
   const from = parsed?.from?.value?.[0];
+  const rawSource = Buffer.isBuffer(source) ? source.toString('utf8') : String(source || '');
   let bodyText = String(parsed?.text || '').trim();
   let bodyHtml = typeof parsed?.html === 'string'
     ? parsed.html
     : (parsed?.html ? String(parsed.html) : '');
+
+  if (!bodyHtml && looksLikeRawMimeSource(rawSource)) {
+    const extractedHtml = extractMimePart(rawSource, 'text/html');
+    const extractedText = extractMimePart(rawSource, 'text/plain');
+    if (extractedHtml) {
+      bodyHtml = extractedHtml;
+      bodyText = extractedText || stripHtml(extractedHtml);
+    } else if (extractedText && !bodyText) {
+      bodyText = extractedText;
+    }
+  }
 
   if (!bodyHtml && looksLikeHtmlContent(bodyText)) {
     bodyHtml = bodyText;
@@ -244,7 +294,7 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceContent }) 
 
   const { data: existing, error: existingError } = await supabase
     .from('inbox_emails')
-    .select('id')
+    .select('id, body_html')
     .eq('account_id', account.id)
     .eq('message_id', messageId)
     .maybeSingle();
@@ -253,7 +303,8 @@ const upsertIncomingEmail = async ({ account, userId, message, sourceContent }) 
     throw new Error(`existing check failed: ${existingError.message}`);
   }
 
-  if (existing) {
+  const existingHasHtml = !!String(existing?.body_html || '').trim();
+  if (existing && existingHasHtml) {
     return { inserted: false, messageId };
   }
 
